@@ -1,7 +1,6 @@
 import asyncio
 import os
 import re
-import uuid
 
 import aiohttp
 from fastapi import FastAPI, HTTPException
@@ -13,7 +12,7 @@ from terabox_gateway import fetch_direct_links
 
 app = FastAPI(
     title="TeraBox Telegram Video Extractor",
-    version="3.0.0",
+    version="3.1.0",
 )
 
 app.add_middleware(
@@ -40,11 +39,14 @@ def safe_filename(filename: str) -> str:
     return filename.strip() or "video.mp4"
 
 
-async def telegram_api(
+async def telegram_request(
     session: aiohttp.ClientSession,
     method: str,
     data: dict,
 ):
+    if not TELEGRAM_BOT_TOKEN:
+        raise Exception("TELEGRAM_BOT_TOKEN is missing")
+
     url = (
         f"https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/{method}"
@@ -55,15 +57,23 @@ async def telegram_api(
         data=data,
         timeout=aiohttp.ClientTimeout(total=120),
     ) as response:
+
+        text = await response.text()
+
+        if response.status != 200:
+            raise Exception(
+                f"Telegram API error {response.status}: {text}"
+            )
+
         return await response.json()
 
 
-async def send_telegram_message(
+async def send_message(
     session: aiohttp.ClientSession,
     chat_id: int,
     text: str,
 ):
-    return await telegram_api(
+    return await telegram_request(
         session,
         "sendMessage",
         {
@@ -73,13 +83,13 @@ async def send_telegram_message(
     )
 
 
-async def send_telegram_video(
+async def send_video(
     session: aiohttp.ClientSession,
     chat_id: int,
     video_url: str,
     filename: str,
 ):
-    return await telegram_api(
+    return await telegram_request(
         session,
         "sendVideo",
         {
@@ -95,7 +105,9 @@ async def extract_terabox(url: str):
     files = await fetch_direct_links(url)
 
     if isinstance(files, dict) and files.get("error"):
-        raise Exception(files.get("error"))
+        raise Exception(
+            str(files.get("error"))
+        )
 
     if not files:
         raise Exception("No files found")
@@ -113,7 +125,10 @@ async def extract_terabox(url: str):
             continue
 
         filename = safe_filename(
-            item.get("filename", "video.mp4")
+            item.get(
+                "filename",
+                "video.mp4",
+            )
         )
 
         results.append(
@@ -126,7 +141,7 @@ async def extract_terabox(url: str):
 
     if not results:
         raise Exception(
-            "Could not get direct download link"
+            "Could not get direct TeraBox link"
         )
 
     return results
@@ -144,6 +159,9 @@ def health_check():
 def health():
     return {
         "status": "healthy",
+        "telegram_configured": bool(
+            TELEGRAM_BOT_TOKEN
+        ),
     }
 
 
@@ -156,7 +174,9 @@ async def extract_video(request: ExtractRequest):
         )
 
     try:
-        files = await extract_terabox(request.url)
+        files = await extract_terabox(
+            request.url
+        )
 
         return {
             "success": True,
@@ -193,15 +213,10 @@ def download_video(filename: str):
     )
 
 
-async def handle_telegram_update(
+async def process_telegram_message(
     session: aiohttp.ClientSession,
-    update: dict,
+    message: dict,
 ):
-    message = update.get("message")
-
-    if not message:
-        return
-
     chat = message.get("chat")
     text = message.get("text", "").strip()
 
@@ -210,87 +225,147 @@ async def handle_telegram_update(
 
     chat_id = chat["id"]
 
+    print(
+        f"Telegram message received: {text}",
+        flush=True,
+    )
+
     if text == "/start":
-        await send_telegram_message(
+        await send_message(
             session,
             chat_id,
-            "Send me a TeraBox link and I will extract the video.",
+            "👋 Send me a TeraBox link.\n\n"
+            "I will extract the video and send it here.",
         )
         return
 
     if text == "/help":
-        await send_telegram_message(
+        await send_message(
             session,
             chat_id,
             "Send a public TeraBox sharing link.",
         )
         return
 
-    if not (
-        "terabox" in text.lower()
-        or "terashare" in text.lower()
+    if (
+        "terabox" not in text.lower()
+        and "terashare" not in text.lower()
     ):
-        await send_telegram_message(
+        await send_message(
             session,
             chat_id,
-            "Please send a valid TeraBox link.",
+            "❌ Please send a valid TeraBox link.",
         )
         return
 
-    await send_telegram_message(
+    await send_message(
         session,
         chat_id,
-        "⏳ Extracting video...",
+        "⏳ Extracting your video...",
     )
 
     try:
         files = await extract_terabox(text)
 
+        print(
+            f"TeraBox files found: {len(files)}",
+            flush=True,
+        )
+
         for item in files:
-            result = await send_telegram_video(
-                session,
-                chat_id,
-                item["direct_url"],
-                item["filename"],
+            filename = item["filename"]
+            direct_url = item["direct_url"]
+
+            print(
+                f"Sending to Telegram: {filename}",
+                flush=True,
             )
 
-            if not result.get("ok"):
-                await send_telegram_message(
+            result = await send_video(
+                session,
+                chat_id,
+                direct_url,
+                filename,
+            )
+
+            if result.get("ok"):
+                print(
+                    f"Video sent successfully: {filename}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"Telegram video error: {result}",
+                    flush=True,
+                )
+
+                await send_message(
                     session,
                     chat_id,
-                    "Telegram could not send this video. "
-                    "The file may be larger than 50 MB.",
+                    "❌ Telegram could not send this video.\n\n"
+                    "The video may be larger than 50 MB "
+                    "or the TeraBox link may have expired.",
                 )
 
     except Exception as error:
-        await send_telegram_message(
+        print(
+            f"Extraction error: {error}",
+            flush=True,
+        )
+
+        await send_message(
             session,
             chat_id,
-            f"❌ Extraction failed:\n{error}",
+            "❌ Extraction failed.\n\n"
+            f"{error}",
         )
 
 
 async def telegram_polling():
     if not TELEGRAM_BOT_TOKEN:
-        print("TELEGRAM_BOT_TOKEN is not configured")
+        print(
+            "❌ TELEGRAM_BOT_TOKEN is missing",
+            flush=True,
+        )
         return
 
-    offset = 0
+    print(
+        "✅ Telegram bot starting...",
+        flush=True,
+    )
 
     async with aiohttp.ClientSession() as session:
-        await telegram_api(
-            session,
-            "deleteWebhook",
-            {
-                "drop_pending_updates": "false",
-            },
-        )
 
-        print("Telegram bot polling started")
+        try:
+            webhook_result = await telegram_request(
+                session,
+                "deleteWebhook",
+                {
+                    "drop_pending_updates": "false",
+                },
+            )
+
+            print(
+                f"Webhook removed: {webhook_result}",
+                flush=True,
+            )
+
+        except Exception as error:
+            print(
+                f"Webhook cleanup error: {error}",
+                flush=True,
+            )
+
+        offset = 0
+
+        print(
+            "✅ Telegram polling started",
+            flush=True,
+        )
 
         while True:
             try:
-                result = await telegram_api(
+                result = await telegram_request(
                     session,
                     "getUpdates",
                     {
@@ -301,26 +376,60 @@ async def telegram_polling():
                 )
 
                 if not result.get("ok"):
+                    print(
+                        f"Telegram getUpdates error: {result}",
+                        flush=True,
+                    )
+
                     await asyncio.sleep(5)
                     continue
 
-                updates = result.get("result", [])
+                updates = result.get(
+                    "result",
+                    [],
+                )
 
-                for update in updates:
-                    offset = update["update_id"] + 1
-
-                    await handle_telegram_update(
-                        session,
-                        update,
+                if updates:
+                    print(
+                        f"Telegram updates received: {len(updates)}",
+                        flush=True,
                     )
 
+                for update in updates:
+                    offset = (
+                        update["update_id"] + 1
+                    )
+
+                    message = update.get(
+                        "message"
+                    )
+
+                    if message:
+                        try:
+                            await process_telegram_message(
+                                session,
+                                message,
+                            )
+
+                        except Exception as error:
+                            print(
+                                f"Message processing error: {error}",
+                                flush=True,
+                            )
+
             except asyncio.CancelledError:
+                print(
+                    "Telegram polling stopped",
+                    flush=True,
+                )
                 raise
 
             except Exception as error:
                 print(
-                    f"Telegram polling error: {error}"
+                    f"Telegram polling error: {error}",
+                    flush=True,
                 )
+
                 await asyncio.sleep(5)
 
 
@@ -330,6 +439,12 @@ telegram_task = None
 @app.on_event("startup")
 async def startup_event():
     global telegram_task
+
+    print(
+        "🚀 FastAPI startup complete",
+        flush=True,
+    )
+
     telegram_task = asyncio.create_task(
         telegram_polling()
     )
@@ -337,6 +452,8 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    global telegram_task
+
     if telegram_task:
         telegram_task.cancel()
 
