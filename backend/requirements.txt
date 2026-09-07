@@ -1,3 +1,4 @@
 fastapi
 uvicorn[standard]
 yt-dlp
+terabox-gateway==2.0.2
