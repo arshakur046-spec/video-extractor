@@ -1,3 +1,4 @@
 fastapi
 uvicorn[standard]
 terabox-gateway==2.0.2
+aiohttp
